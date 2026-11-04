@@ -1,71 +1,143 @@
-// main_polling.c
-// Lab 5: polling version of the encoder reader, used only for comparison with main.c.
+// Arthur Cary
+// pollingtest.c
+// Lab 5: Polling version of the encoder decoder, for comparison with interrupts.
 
-#include <stdio.h>
-#include <stdint.h>
-#include "stm32l432xx.h"
+#include "main.h"
+#include "interrupt.h"
 
-#define ENC_A_PIN       9
-#define ENC_B_PIN       10
-#define PPR             408
-#define COUNTS_PER_REV  (4 * PPR)
-#define SYSCLK_HZ       4000000UL
-#define TIMER_FREQ_HZ   1000000UL
-#define UPDATE_US       500000UL
+#define SHOW_DIAGNOSTICS  1
+#define EXTRA_WORK_US     0
+#define MISSED_STEP       2
 
-static const int8_t QUAD_TABLE[16] = {
-   0, -1,  1,  0,
-   1,  0,  0, -1,
-  -1,  0,  0,  1,
-   0,  1, -1,  0
+// same as interrupt.c, but double jumps are marked so they can be counted
+static const int8_t STEP_LUT[16] = {
+     0,  1, -1,  2,
+    -1,  0,  2,  1,
+     1,  2,  0, -1,
+     2, -1,  1,  0
 };
 
-int _write(int file, char *ptr, int len) {
-  int i = 0;
-  for (i = 0; i < len; i++) {
-    ITM_SendChar((*ptr++));
-  }
-  return len;
+typedef struct {
+    int32_t  position;
+    uint32_t time;
+} SpeedRef;
+
+static uint8_t readPins(void) {
+    uint32_t idr = GPIOA->IDR;
+    return (uint8_t)((((idr >> gpioPinOffset(ENC_A_PIN)) & 1u) << 1) |
+                      ((idr >> gpioPinOffset(ENC_B_PIN)) & 1u));
 }
 
-static uint8_t readEncoderState(void) {
-  uint32_t idr = GPIOA->IDR;
-  return (((idr >> ENC_A_PIN) & 1) << 1) | ((idr >> ENC_B_PIN) & 1);
+static void cycleCounterInit(void) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static void busyWait(uint32_t cycles) {
+    uint32_t start = DWT->CYCCNT;
+    while ((DWT->CYCCNT - start) < cycles) {
+    }
+}
+
+// identical to estimateSpeed() in main.c
+static float estimateSpeed(SpeedRef *ref, const EncoderSample *s, uint32_t now) {
+    int32_t  counts = s->position - ref->position;
+    uint32_t window = now - ref->time;
+    uint32_t idle   = now - s->edgeTime;
+
+    ref->position = s->position;
+    ref->time     = now;
+
+    int32_t magnitude = (counts < 0) ? -counts : counts;
+    if (magnitude >= MIN_WINDOW_COUNTS) {
+        return (float)counts * TICK_HZ / ((float)COUNTS_PER_REV * (float)window);
+    }
+    if (s->edgePeriod == 0 || idle > STOP_TIMEOUT_TICKS) {
+        return 0.0f;
+    }
+    uint32_t period = (idle > s->edgePeriod) ? idle : s->edgePeriod;
+    return (float)s->dir * TICK_HZ / ((float)COUNTS_PER_REV * (float)period);
 }
 
 int main(void) {
-  int32_t count = 0;
-  uint32_t lastUpdate = 0;
-  uint8_t state = 0;
+    configureFlash();
+    configureClock();
+    SystemCoreClockUpdate();
 
-  RCC->AHB2ENR |= RCC_AHB2ENR_GPIOAEN;
-  GPIOA->MODER &= ~(GPIO_MODER_MODE9 | GPIO_MODER_MODE10);
-  GPIOA->PUPDR &= ~(GPIO_PUPDR_PUPD9 | GPIO_PUPDR_PUPD10);
+    timestampInit();
+    cycleCounterInit();
 
-  RCC->APB1ENR1 |= RCC_APB1ENR1_TIM2EN;
-  TIM2->PSC = (SYSCLK_HZ / TIMER_FREQ_HZ) - 1;
-  TIM2->ARR = 0xFFFFFFFF;
-  TIM2->EGR = TIM_EGR_UG;
-  TIM2->CR1 |= TIM_CR1_CEN;
+    gpioEnable(GPIO_PORT_A);
+    pinMode(ENC_A_PIN, GPIO_INPUT);
+    pinMode(ENC_B_PIN, GPIO_INPUT);
 
-  state = readEncoderState();
-  lastUpdate = TIM2->CNT;
+    const uint32_t cyclesPerUs = SystemCoreClock / 1000000u;
+    const uint32_t extraCycles = EXTRA_WORK_US * cyclesPerUs;
 
-  while (1) {
-    uint8_t newState = readEncoderState();
-    count += QUAD_TABLE[(state << 2) | newState];
-    state = newState;
+    printf("POLLING TEST: %lu Hz clock, %d us extra work per loop\n",
+           (unsigned long)SystemCoreClock, EXTRA_WORK_US);
 
-    if ((uint32_t)(TIM2->CNT - lastUpdate) >= UPDATE_US) {
-      lastUpdate += UPDATE_US;
-      float velocity = ((float)count * TIMER_FREQ_HZ) / ((float)COUNTS_PER_REV * UPDATE_US);
-      int32_t milliRev = (int32_t)(velocity * 1000.0f);
-      const char *dir = (milliRev > 0) ? "CW" : (milliRev < 0) ? "CCW" : "STOPPED";
-      if (milliRev < 0) {
-        milliRev = -milliRev;
-      }
-      printf("Speed: %ld.%03ld rev/s  Direction: %s\n", milliRev / 1000, milliRev % 1000, dir);
-      count = 0;
+    EncoderSample enc = {0};
+    enc.edgeTime = ENC_TIMER->CNT;
+    uint8_t lastState = readPins();
+
+    uint32_t missed     = 0;
+    uint32_t maxGap     = 0;
+    uint32_t lastSample = DWT->CYCCNT;
+
+    SpeedRef ref = { 0, ENC_TIMER->CNT };
+    uint32_t lastUpdate = ref.time;
+
+    while (1) {
+        uint32_t cyc = DWT->CYCCNT;
+        if (cyc - lastSample > maxGap) {
+            maxGap = cyc - lastSample;
+        }
+        lastSample = cyc;
+
+        uint8_t state = readPins();
+        int8_t  step  = STEP_LUT[(lastState << 2) | state];
+        lastState = state;
+
+        if (step == MISSED_STEP) {
+            missed++;
+        } else if (step != 0) {
+            uint32_t t = ENC_TIMER->CNT;
+            enc.position  += step;
+            enc.dir        = step;
+            enc.edgePeriod = t - enc.edgeTime;
+            enc.edgeTime   = t;
+        }
+
+        if (extraCycles > 0) {
+            busyWait(extraCycles);
+        }
+
+        if ((ENC_TIMER->CNT - lastUpdate) < UPDATE_TICKS) {
+            continue;
+        }
+
+        uint32_t now = ENC_TIMER->CNT;
+        lastUpdate = now;
+        float rps = estimateSpeed(&ref, &enc, now);
+
+        if (rps == 0.0f) {
+            printf("STOPPED  0.000 rev/s");
+        } else {
+            printf("%s  %.3f rev/s", (rps > 0.0f) ? LABEL_POS : LABEL_NEG,
+                   (rps > 0.0f) ? rps : -rps);
+        }
+#if SHOW_DIAGNOSTICS
+        float maxRps = (maxGap > 0)
+            ? (float)SystemCoreClock / ((float)COUNTS_PER_REV * (float)maxGap)
+            : 0.0f;
+        printf("   [missed %lu, gap %lu us, max %.2f rev/s]",
+               (unsigned long)missed, (unsigned long)(maxGap / cyclesPerUs), maxRps);
+#endif
+        printf("\n");
+
+        missed = 0;
+        maxGap = 0;
     }
-  }
 }
